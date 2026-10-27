@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# hwq [--role R] [--vram GB] [--mins N] <group> <label> -- <cmd...>   |   hwq status
+# A thin wrapper over pueue. pueue only executes; gsched owns GPU airtime. Jobs in a group named gpu<INDEX> (for example gpu0)
+# book a gsched lease on that GPU when they start and release it when they end; other groups run unchanged.
+# Env: HWQ_GSCHED (path to gsched, default: gsched on PATH), GSCHED_DIR (holds gsched.conf), HWQ_MAX_C (GPU temperature limit, default 70),
+# HWQ_WAIT (seconds to wait for airtime, default 900), HWQ_TEMP_CMD (command printing a GPU temperature for the index in $1), HWQ_FAKE_TEMP (tests).
+case ${1-} in -h|--help) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+set -u
+MAXC=${HWQ_MAX_C:-70}
+GS=${HWQ_GSCHED:-$(command -v gsched || echo gsched)}
+CONF=${GSCHED_CONF:-${GSCHED_DIR:-$HOME/.local/state/gsched}/gsched.conf}
+if [ "${1:-}" = status ]; then exec pueue status columns=id,status,label,start,end; fi
+if [ "${1:-}" = _lease ]; then   # internal, runs inside pueue: _lease ROLE GPU VRAM MINS LABEL -- cmd...
+  role=$2; gpu=$3; vram=$4; mins=$5; label=$6; shift 7
+  out=$("$GS" book "$role" --gpu "$gpu" --vram "$vram" --mins "$mins" --reason "hwq queued job: $label" --purpose "hwq pueue task $label on gpu $gpu" 2>&1) || { echo "hwq: booking refused: $out" >&2; exit 4; }
+  id=$(grep -oE "(lease|queued) [0-9]+" <<<"$out" | head -1 | grep -oE "[0-9]+")
+  [ -n "$id" ] || { echo "hwq: no booking id in: $out" >&2; exit 4; }
+  trap '"$GS" release "$id" >/dev/null 2>&1' EXIT
+  end=$((SECONDS + ${HWQ_WAIT:-900}))
+  until [ "$("$GS" ls | awk -F"\t" -v i="$id" '$1==i{print $2}')" = active ]; do
+    [ $SECONDS -ge $end ] && { echo "hwq: no airtime on gpu $gpu in ${HWQ_WAIT:-900} s, giving up ($out)" >&2; exit 5; }
+    "$GS" tick >/dev/null 2>&1; sleep 5
+  done
+  echo "hwq: lease $id active on gpu $gpu for $role" >&2
+  "$@"; exit $?
+fi
+role=${GSCHED_ROLE:-}; vram=0; mins=30
+while [ $# -gt 0 ]; do case $1 in --role) role=$2; shift 2;; --vram) vram=$2; shift 2;; --mins) mins=$2; shift 2;; *) break;; esac; done
+if [ $# -lt 4 ] || [ "$3" != -- ]; then echo "usage: hwq [--role R] [--vram GB] [--mins N] <group> <label> -- <cmd...> | hwq status" >&2; exit 2; fi
+g=$1; l=$2; shift 3
+cmd=$(printf '%q ' "$@")
+if [[ $g == gpu* ]]; then
+  if ! grep -qE "^${role:-/}=[0-9]+" "$CONF" 2>/dev/null; then echo "hwq: gpu jobs need a gsched role (--role or GSCHED_ROLE); got \"${role}\"" >&2; exit 4; fi
+  idx=${g#gpu}
+  if [ -n "${HWQ_FAKE_TEMP:-}" ]; then t=$HWQ_FAKE_TEMP
+  elif [ -n "${HWQ_TEMP_CMD:-}" ]; then t=$($HWQ_TEMP_CMD "$idx" 2>/dev/null | head -1)
+  else t=$(timeout 6 nvidia-smi -i "$idx" --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | head -1); fi
+  t=$(tr -dc 0-9 <<<"${t%.*}")
+  if [ "${t:-0}" -ge "$MAXC" ]; then echo "hwq: refused, $g at ${t} C (limit ${MAXC} C)" >&2; exit 3; fi
+  exec pueue add -g "$g" -l "$l" -- "nice -n 10 $(readlink -f "$0") _lease $role $idx $vram $mins $(printf %q "$l") -- $cmd"
+fi
+exec pueue add -g "$g" -l "$l" -- "nice -n 10 $cmd"

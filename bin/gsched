@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""gsched: GPU airtime leases. Jobs book a GPU for a number of minutes; bookings are placed by priority class and VRAM fit,
+queued when the card is busy, and can preempt lower-class bookings that declared themselves restartable.
+
+  gsched book ROLE --vram GB --mins N [--gpu any|INDEX|UUID] [--wait] [--reason T] [--restartable --ckpt-cmd CMD] [--keep]
+  gsched run  ROLE [same options] -- CMD...   book, run CMD in a systemd user unit with CUDA_VISIBLE_DEVICES set, release at exit
+  gsched extend ID --mins N | release ID | receipt ID --outcome T [--metric M --before B --after A --outputs a,b --note N]
+  gsched ls | why ID | tick
+
+--vram 0 takes the whole card. Roles map to classes (1 = highest priority) in $GSCHED_DIR/gsched.conf, one ROLE=CLASS per line,
+plus optional DEFAULT_CLASS=N (roles not listed get it; otherwise they are refused) and GRACE_S=seconds (default 120).
+State lives in $GSCHED_DIR (default ~/.local/state/gsched). GPUs are read from nvidia-smi ($GSCHED_SMI overrides the command).
+Run `gsched tick` from a timer (every minute) so queued bookings start and expired ones end."""
+import argparse, fcntl, json, os, subprocess, sys, time
+
+
+class Refuse(Exception):
+    pass
+
+
+def d():
+    p = os.environ.get("GSCHED_DIR") or os.path.expanduser("~/.local/state/gsched")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def P(f):
+    return os.path.join(d(), f)
+
+
+def now():
+    return time.time()
+
+
+def sysrun():
+    return os.environ.get("GSCHED_SYSTEMD_RUN", "systemd-run")
+
+
+def systemctl():
+    return os.environ.get("GSCHED_SYSTEMCTL", "systemctl")
+
+
+class Lock:
+    def __enter__(self):
+        self.f = open(P("lock"), "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+
+def conf():
+    """Return (role -> class number, options)."""
+    cls, opt = {}, {}
+    try:
+        with open(os.environ.get("GSCHED_CONF") or P("gsched.conf")) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    for ln in lines:
+        ln = ln.split("#")[0].strip()
+        if "=" not in ln:
+            continue
+        k, v = (s.strip() for s in ln.split("=", 1))
+        if k.isupper() and k in ("DEFAULT_CLASS", "GRACE_S"):
+            opt[k] = v
+        elif v.isdigit():
+            cls[k] = int(v)
+    return cls, opt
+
+
+def class_of(role):
+    cls, opt = conf()
+    if role in cls:
+        return cls[role]
+    if str(opt.get("DEFAULT_CLASS", "")).isdigit():
+        return int(opt["DEFAULT_CLASS"])
+    raise Refuse("unknown role %s (add ROLE=CLASS to gsched.conf)" % role)
+
+
+def gpus():
+    """[{idx, uuid, name, total_gb}] from nvidia-smi."""
+    cmd = os.environ.get("GSCHED_SMI", "nvidia-smi")
+    try:
+        out = subprocess.run([cmd, "--query-gpu=index,uuid,name,memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    res = []
+    for ln in out.splitlines():
+        p = [x.strip() for x in ln.split(",")]
+        if len(p) >= 4 and p[0].isdigit():
+            res.append({"idx": int(p[0]), "uuid": p[1], "name": p[2], "total_gb": float(p[3]) / 1024.0})
+    return res
+
+
+def db():
+    try:
+        with open(P("state.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"next": 1, "b": {}}
+
+
+def save(st):
+    with open(P("state.json") + ".tmp", "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(P("state.json") + ".tmp", P("state.json"))
+
+
+def get(st, i):
+    b = st["b"].get(str(i))
+    if b is None:
+        raise Refuse("no booking %s" % i)
+    return b
+
+
+def receipts():
+    try:
+        with open(P("receipts.jsonl")) as f:
+            return [json.loads(x) for x in f if x.strip()]
+    except OSError:
+        return []
+
+
+def write_receipt(rec):
+    with open(P("receipts.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def stop_unit(b):
+    if b.get("unit"):
+        subprocess.run([systemctl(), "--user", "stop", b["unit"]], capture_output=True)
+
+
+def need_gb(b, g):
+    return g["total_gb"] if not b["vram"] else b["vram"]
+
+
+def fits(b, g, st):
+    used = sum(need_gb(x, g) for x in st["b"].values() if x["state"] == "active" and x.get("gpu") == g["idx"] and not x.get("keep"))
+    return used + need_gb(b, g) <= g["total_gb"] + 1e-6
+
+
+def candidates(b, gs):
+    want = str(b["gpu_pref"])
+    return [g for g in gs if want == "any" or want == str(g["idx"]) or want == g["uuid"]]
+
+
+def activate(b, g):
+    b.update(state="active", gpu=g["idx"], uuid=g["uuid"], start=now(), expires=now() + b["mins"] * 60)
+
+
+def try_place(b, st, gs):
+    if b.get("keep"):
+        b.update(state="active", gpu=None, uuid=None, start=now(), expires=now() + b["mins"] * 60)
+        return True
+    for g in candidates(b, gs):
+        if fits(b, g, st):
+            activate(b, g)
+            return True
+    return False
+
+
+def preempt_for(b, st, gs):
+    """Free a card for b by stopping lower-class restartable bookings (checkpoint first). Returns True if b could be placed."""
+    for g in candidates(b, gs):
+        victims = sorted((x for x in st["b"].values() if x["state"] == "active" and x.get("gpu") == g["idx"] and not x.get("keep")),
+                         key=lambda x: (-x["cls"], -x["id"]))
+        freed = []
+        for v in victims:
+            if v["cls"] <= b["cls"] or not v.get("restartable"):
+                continue
+            freed.append(v)
+            test = {"b": {k: x for k, x in st["b"].items() if x not in freed}}
+            if fits(b, g, test):
+                for x in freed:
+                    if x.get("ckpt_cmd"):
+                        subprocess.run(x["ckpt_cmd"], shell=True, capture_output=True, timeout=float(os.environ.get("GSCHED_CKPT_WAIT", 90)))
+                    x["state"] = "queued"
+                    x["preempted_by"] = b["id"]
+                    stop_unit(x)
+                activate(b, g)
+                return True
+    return False
+
+
+def tick():
+    """Expire overdue bookings, then place queued ones in (class, id) order, preempting restartable lower classes."""
+    gs = gpus()
+    with Lock():
+        st = db()
+        cls_opt = conf()[1]
+        grace = float(os.environ.get("GSCHED_GRACE") or cls_opt.get("GRACE_S", 120))
+        for b in st["b"].values():
+            if b["state"] == "active" and b["expires"] + grace <= now():
+                b["state"] = "ended"
+                b["outcome"] = "expired"
+                stop_unit(b)
+                write_receipt({"id": b["id"], "role": b["role"], "outcome": "expired", "ts": now()})
+        for b in sorted((x for x in st["b"].values() if x["state"] == "queued"), key=lambda x: (x["cls"], x["id"])):
+            if not try_place(b, st, gs):
+                preempt_for(b, st, gs)
+        save(st)
+
+
+def book(role, reason, purpose, mins, vram, gpu, wait, restartable, ckpt_cmd, keep=False):
+    cls = class_of(role)
+    gs = gpus()
+    if not keep:
+        cand = candidates({"gpu_pref": gpu}, gs)
+        if not cand:
+            raise Refuse("no GPU matches --gpu %s" % gpu)
+        if vram and all(vram > g["total_gb"] for g in cand):
+            raise Refuse("--vram %.1f GB exceeds every matching GPU" % vram)
+    with Lock():
+        st = db()
+        i = st["next"]
+        st["next"] = i + 1
+        b = {"id": i, "role": role, "cls": cls, "state": "queued", "vram": vram, "mins": mins, "gpu_pref": gpu, "reason": reason or "",
+             "purpose": purpose or "", "restartable": restartable, "ckpt_cmd": ckpt_cmd, "keep": keep, "gpu": None, "created": now()}
+        st["b"][str(i)] = b
+        if not try_place(b, st, gs):
+            preempt_for(b, st, gs)
+        save(st)
+    if wait:
+        end = now() + float(os.environ.get("GSCHED_WAIT", 900))
+        while b["state"] != "active" and now() < end:
+            time.sleep(5)
+            tick()
+            b = get(db(), i)
+    if b["state"] == "active":
+        return "lease %d active on gpu %s for %s until %s" % (i, b.get("gpu", "-"), role, time.strftime("%H:%M", time.localtime(b["expires"]))), b
+    return "queued %d (class %d) waiting for a GPU" % (i, cls), b
+
+
+def extend(i, mins):
+    with Lock():
+        st = db()
+        b = get(st, i)
+        if b["state"] != "active":
+            raise Refuse("booking %s is %s, not active" % (i, b["state"]))
+        b["expires"] += mins * 60
+        save(st)
+    return "extended %d by %d min" % (i, mins)
+
+
+def release(i, outcome="released"):
+    with Lock():
+        st = db()
+        b = get(st, i)
+        if b["state"] != "ended":
+            b["state"] = "ended"
+            b["outcome"] = outcome
+            write_receipt({"id": i, "role": b["role"], "outcome": outcome, "start": b.get("start"), "end": now(), "reason": b["reason"]})
+            save(st)
+    tick()
+    return "released %d" % i
+
+
+def receipt(i, outcome, metric, before, after, outputs, note):
+    st = db()
+    b = get(st, i)
+    write_receipt({"id": i, "role": b["role"], "outcome": outcome, "metric": metric, "before": before, "after": after,
+                   "outputs": outputs, "note": note, "ts": now()})
+    return "receipt recorded for %d" % i
+
+
+def set_unit(i, unit, cmd):
+    with Lock():
+        st = db()
+        b = get(st, i)
+        b["unit"], b["cmd"] = unit, cmd
+        save(st)
+
+
+def common(p):
+    p.add_argument("role")
+    p.add_argument("--reason")
+    p.add_argument("--purpose")
+    p.add_argument("--vram", type=float, default=0, help="VRAM in GB (0 = whole card)")
+    p.add_argument("--mins", type=int, default=60)
+    p.add_argument("--gpu", default="any")
+    p.add_argument("--wait", action="store_true")
+    p.add_argument("--restartable", action="store_true", help="may be stopped and requeued for a higher class")
+    p.add_argument("--ckpt-cmd", help="shell command run before a preemption stop")
+
+
+def main(argv=None):
+    a = argparse.ArgumentParser(prog="gsched", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = a.add_subparsers(dest="cmd", required=True)
+    b = sp.add_parser("book")
+    common(b)
+    b.add_argument("--keep", action="store_true", help="marker for an always-on server: occupies no VRAM in the plan")
+    common(sp.add_parser("run"))
+    e = sp.add_parser("extend")
+    e.add_argument("id", type=int)
+    e.add_argument("--mins", type=int, required=True)
+    sp.add_parser("release").add_argument("id", type=int)
+    c = sp.add_parser("receipt")
+    c.add_argument("id", type=int)
+    c.add_argument("--outcome", required=True)
+    c.add_argument("--metric")
+    c.add_argument("--before")
+    c.add_argument("--after")
+    c.add_argument("--outputs", default="")
+    c.add_argument("--note", default="")
+    sp.add_parser("ls")
+    sp.add_parser("why").add_argument("id", type=int)
+    sp.add_parser("tick")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cmd = []
+    if "--" in argv:
+        k = argv.index("--")
+        argv, cmd = argv[:k], argv[k + 1:]
+    n = a.parse_args(argv)
+    try:
+        if n.cmd == "book":
+            print(book(n.role, n.reason, n.purpose, n.mins, n.vram, n.gpu, n.wait, n.restartable, n.ckpt_cmd, n.keep)[0])
+        elif n.cmd == "run":
+            if not cmd:
+                raise Refuse("no command given after --")
+            msg, b = book(n.role, n.reason, n.purpose, n.mins, n.vram, n.gpu, n.wait, n.restartable, n.ckpt_cmd)
+            print(msg)
+            if b["state"] != "active":
+                return 3
+            unit = "gjob-%s-%d" % (b["role"], b["id"])
+            set_unit(b["id"], unit, cmd)
+            rc = subprocess.run([sysrun(), "--user", "--unit", unit, "--collect", "--wait", "-p", "Nice=10",
+                                 "-E", "CUDA_VISIBLE_DEVICES=%s" % b["uuid"], "--", *cmd]).returncode
+            with Lock():
+                cur = get(db(), b["id"]).copy()
+            if cur["state"] == "queued":
+                print("requeued %d (stopped for a higher class; rerun to restart)" % b["id"])
+                return 75
+            if cur["state"] == "ended":
+                return rc
+            release(b["id"], "done" if rc == 0 else "failed")
+            return rc
+        elif n.cmd == "extend":
+            print(extend(n.id, n.mins))
+        elif n.cmd == "release":
+            print(release(n.id))
+        elif n.cmd == "receipt":
+            print(receipt(n.id, n.outcome, n.metric, n.before, n.after, [x for x in n.outputs.split(",") if x], n.note))
+        elif n.cmd == "ls":
+            for x in db()["b"].values():
+                if x["state"] != "ended":
+                    print("%s\t%s\t%s\tc%s\tgpu=%s\t%s" % (x["id"], x["state"], x["role"], x["cls"], x.get("gpu", "-"), x["reason"]))
+        elif n.cmd == "why":
+            print(get(db(), n.id))
+            for r in receipts():
+                if r["id"] == n.id:
+                    print(r)
+        elif n.cmd == "tick":
+            tick()
+    except Refuse as x:
+        print("refused: %s" % x, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

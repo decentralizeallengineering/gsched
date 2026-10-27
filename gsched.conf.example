@@ -1,0 +1,7 @@
+# gsched.conf: copy to $GSCHED_DIR/gsched.conf (default ~/.local/state/gsched/gsched.conf).
+# ROLE=CLASS, class 1 is the highest priority. Roles are free-form names you choose.
+interactive=1
+training=2
+batch=3
+# DEFAULT_CLASS=3   # roles not listed above get this class instead of being refused
+# GRACE_S=120       # seconds an overdue booking keeps its GPU before tick ends it
