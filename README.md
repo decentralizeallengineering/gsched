@@ -1,5 +1,7 @@
 # gsched
 
+[![tests](https://github.com/decentralizeallengineering/gsched/actions/workflows/tests.yml/badge.svg)](https://github.com/decentralizeallengineering/gsched/actions/workflows/tests.yml) ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+
 GPU airtime scheduling for one machine, plus `hwq`, a wrapper that runs queued jobs through [pueue](https://github.com/Nukesor/pueue) with a GPU lease.
 
 Several people or agents sharing a few GPUs step on each other. `gsched` makes the GPU a booked resource:
